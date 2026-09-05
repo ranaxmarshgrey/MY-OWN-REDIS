@@ -4,13 +4,15 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"main/core"
 	"net"
-
-	// "sync"
 	"sync/atomic"
-	// "time"
-	// "bytes"
 )
+
+// "sync"
+
+// "time"
+// "bytes"
 
 func main() {
 	// fmt.Println("hello,go")
@@ -72,7 +74,14 @@ func handleClient(conn net.Conn, client_count *atomic.Int64) {
 			log.Printf("Client disconnected: %s , Active clients: %d", conn.RemoteAddr(), client_count.Load())
 			break
 		}
-		respond(conn, command)
 
+		tokens, err := core.DecodeToArrayOfStrings([]byte(command))
+		if err != nil {
+			log.Printf("error decoding command: %v", err)
+			core.RespondError(err, conn)
+			continue
+		}
+		cmd := core.ParseCommand(tokens)
+		core.EvalAndRespond(cmd, conn)
 	}
 }

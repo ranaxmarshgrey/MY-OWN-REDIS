@@ -144,3 +144,17 @@ func decodeArray(data []byte) (interface{}, int, error) {
 
 	return arr, pos, nil
 }
+
+func DecodeToArrayOfStrings(data []byte) ([]string, error) {
+	result, err := Decode(data)
+	if err != nil {
+		return nil, err
+	}
+	arr := result.([]interface{})
+	tokens := make([]string, len(arr))
+	for i, v := range arr {
+		tokens[i] = v.(string)
+	}
+
+	return tokens, nil
+}
