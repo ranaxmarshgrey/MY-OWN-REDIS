@@ -20,6 +20,20 @@ func ParseCommand(tokens []string) RedisCmd {
 	return cmd
 }
 
+func Eval(tokens []string) ([]byte, error) {
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("ERR empty command")
+	}
+	cmd := ParseCommand(tokens)
+	switch cmd.Cmd {
+	case "PING":
+		return EvalPing(cmd.Args)
+	default:
+		return nil, fmt.Errorf("ERR unknown command '%s'", cmd.Cmd)
+	}
+}
+
+
 func EvalPing(args []string) ([]byte, error) {
 	if len(args) == 0 {
 		return Encode("PONG", true), nil

@@ -5,8 +5,9 @@ import (
 	"strconv"
 )
 
+// Decode decodes a single complete RESP value and ensures there is no trailing data.
 func Decode(data []byte) (interface{}, error) {
-	val, consumed, err := decodeOne(data)
+	val, consumed, err := DecodeOne(data)
 	if err != nil {
 		return nil, err
 	}
@@ -15,6 +16,13 @@ func Decode(data []byte) (interface{}, error) {
 	}
 	return val, nil
 }
+
+// DecodeOne attempts to decode a single RESP value from data.
+// It returns the decoded value, the number of bytes consumed (delta), and an error if decoding fails.
+func DecodeOne(data []byte) (interface{}, int, error) {
+	return decodeOne(data)
+}
+
 
 func decodeOne(data []byte) (interface{}, int, error) {
 	if len(data) == 0 {

@@ -125,3 +125,45 @@ func TestDecodeNullAndEmptyValues(t *testing.T) {
 		t.Errorf("Decode empty bulk string = %v, want empty string", value)
 	}
 }
+
+func TestDecodeOne(t *testing.T) {
+	// Test single command with consumed bytes
+	input := []byte("*1\r\n$4\r\nPING\r\n")
+	val, delta, err := DecodeOne(input)
+	if err != nil {
+		t.Fatalf("DecodeOne failed: %v", err)
+	}
+	if delta != len(input) {
+		t.Errorf("expected delta %d, got %d", len(input), delta)
+	}
+	arr, ok := val.([]interface{})
+	if !ok || len(arr) != 1 || arr[0] != "PING" {
+		t.Errorf("unexpected value: %v", val)
+	}
+
+	// Test streaming multiple commands (pipelined data)
+	stream := []byte("*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n")
+	val1, delta1, err1 := DecodeOne(stream)
+	if err1 != nil {
+		t.Fatalf("DecodeOne command 1 failed: %v", err1)
+	}
+	if delta1 != 14 {
+		t.Errorf("expected delta1 14, got %d", delta1)
+	}
+	if arr1, ok := val1.([]interface{}); !ok || arr1[0] != "PING" {
+		t.Errorf("unexpected command 1: %v", val1)
+	}
+
+	// Next command starting at delta1
+	val2, delta2, err2 := DecodeOne(stream[delta1:])
+	if err2 != nil {
+		t.Fatalf("DecodeOne command 2 failed: %v", err2)
+	}
+	if delta2 != 14 {
+		t.Errorf("expected delta2 14, got %d", delta2)
+	}
+	if arr2, ok := val2.([]interface{}); !ok || arr2[0] != "PING" {
+		t.Errorf("unexpected command 2: %v", val2)
+	}
+}
+
