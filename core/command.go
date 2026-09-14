@@ -1,10 +1,11 @@
 package core
 
 import (
+	"errors"
 	"fmt"
-	"log"
-	"net"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type RedisCmd struct {
@@ -28,11 +29,19 @@ func Eval(tokens []string) ([]byte, error) {
 	switch cmd.Cmd {
 	case "PING":
 		return EvalPing(cmd.Args)
+
+	case "SET":
+		return EvalSet(cmd.Args)
+
+	case "GET":
+		return EvalGet(cmd.Args)
+
+	case "TTL":
+		return EvalTtl(cmd.Args)
 	default:
 		return nil, fmt.Errorf("ERR unknown command '%s'", cmd.Cmd)
 	}
 }
-
 
 func EvalPing(args []string) ([]byte, error) {
 	if len(args) == 0 {
@@ -45,42 +54,128 @@ func EvalPing(args []string) ([]byte, error) {
 
 }
 
-func Encode(val interface{}, isSimple bool) []byte {
-	str, ok := val.(string)
-	if !ok {
-		return nil
+func EvalSet(args []string) ([]byte, error) {
+
+	if len(args) < 2 {
+		return nil, errors.New("ERR wrong number of arguments")
+
 	}
-	if isSimple {
-		s := "+" + str + "\r\n"
-		// simpleStr:= fmt.Sprintf("+&s\r\n",str)
-		return []byte(s)
-	} else {
-		length := len(str)
+	key := args[0]
+	value := args[1]
+	var durationMs int64 = -1
 
-		bulkString := fmt.Sprintf("$%d\r\n%s\r\n", length, str)
-		return []byte(bulkString)
-	}
+	for i := 2; i < len(args); i++ {
+		arg := strings.ToUpper(args[i])
 
-}
+		if arg == "EX" && i+1 < len(args) {
+			sec, err := strconv.ParseInt(args[i+1], 10, 64)
+			if err != nil || sec <= 0 {
+				return nil, errors.New("ERR invalid expire time")
+			}
+			durationMs = sec * 1000
+			i++
 
-func EvalAndRespond(cmd RedisCmd, conn net.Conn) {
-	command := cmd.Cmd
-	switch command {
-	case "PING":
-		resp, err := EvalPing(cmd.Args)
-		if err != nil {
-			RespondError(err, conn)
-			return
+		} else if arg == "PX" && i+1 < len(args) {
+			ms, err := strconv.ParseInt(args[i+1], 10, 64)
+			if err != nil || ms <= 0 {
+				return nil, errors.New("ERR invalid expire time")
+			}
+			durationMs = ms
+			i++
+		} else {
+			return nil, errors.New("ERR syntax error")
 		}
-		conn.Write(resp)
-	default:
-		log.Printf("Unknown command: %s", cmd.Cmd)
-
 	}
+
+	obj := NewObject(value, durationMs)
+	Put(key, obj)
+	return RESP_OK, nil
+
 }
 
-func RespondError(err error, conn net.Conn) {
-	str := "-" + err.Error() + "\r\n"
-	em := []byte(str)
-	conn.Write(em)
+func EvalGet(args []string) ([]byte, error) {
+	if len(args) != 1 {
+		return nil, errors.New("ERR wrong number of arguments for 'get' command")
+	}
+
+	key := args[0]
+	obj := Get(key)
+	if obj == nil {
+		return Encode(nil, false), nil
+
+	}
+	if obj.ExpiresAt != -1 && time.Now().UnixMilli() >= obj.ExpiresAt {
+		delete(store, key)
+		return Encode(nil, false), nil
+	}
+	return Encode(obj.Value, false), nil
+
+}
+
+func EvalTtl(args []string) ([]byte, error) {
+	if len(args) != 1 {
+		return nil, errors.New("ERR wrong number of arguments for 'ttl' command")
+
+	}
+	key := args[0]
+	obj := Get(key)
+	if obj == nil {
+		return Encode(int64(-2), false), nil
+	}
+	if obj.ExpiresAt == -1 {
+		return Encode(int64(-1), false), nil
+	}
+
+	nowMs := time.Now().UnixMilli()
+	durationLeft := obj.ExpiresAt - nowMs
+	if durationLeft < 0 {
+		delete(store, key)
+		return Encode(int64(-2), false), nil
+	}
+
+	secondsLeft := durationLeft / 1000
+
+	return Encode(int64(secondsLeft), false), nil
+}
+
+var RESP_OK = []byte("+OK\r\n")
+
+func Encode(val interface{}, isSimple bool) []byte {
+
+	//this older verison of encode only encode the simple string or bulk string
+
+	// str, ok := val.(string)
+	// if !ok {
+	// 	return nil
+	// }
+	// if isSimple {
+	// 	s := "+" + str + "\r\n"
+	// 	// simpleStr:= fmt.Sprintf("+&s\r\n",str)
+	// 	return []byte(s)
+	// } else {
+	// 	length := len(str)
+
+	// 	bulkString := fmt.Sprintf("$%d\r\n%s\r\n", length, str)
+	// 	return []byte(bulkString)
+	// }
+
+	//new version of encode
+	switch v := val.(type) {
+	case nil:
+		return []byte("$-1\r\n")
+
+	case int64:
+		return []byte(fmt.Sprintf(":%d\r\n", v))
+
+	case string:
+		if isSimple {
+			return []byte("+" + v + "\r\n")
+		}
+		return []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(v), v))
+
+	default:
+		return nil
+
+	}
+
 }
