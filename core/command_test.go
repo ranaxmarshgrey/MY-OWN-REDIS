@@ -671,6 +671,10 @@ func TestPassiveCleanupComprehensive(t *testing.T) {
 }
 
 func TestDeleteExpiredKeys(t *testing.T) {
+	oldLimit := keyLimit
+	keyLimit = 100
+	defer func() { keyLimit = oldLimit }()
+
 	// 1. Empty store: should return gracefully without panic
 	clearStore()
 	DeleteExpiredKeys()

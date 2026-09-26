@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"my-own-redis/core"
 	"testing"
 	"time"
@@ -437,5 +438,83 @@ func TestProcessClientBufferPassiveAndActiveCleanup(t *testing.T) {
 		t.Fatalf("expected $-1\\r\\n after active cleanup, got: %q", string(reply))
 	}
 }
+
+func TestProcessClientBufferRandomEviction(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("Socketpair failed: %v", err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+
+	client := &Client{
+		fd:      fds[0],
+		readBuf: make([]byte, 0),
+	}
+
+	readReply := func() []byte {
+		buf := make([]byte, 1024)
+		n, err := unix.Read(fds[1], buf)
+		if err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		return buf[:n]
+	}
+
+	core.ClearStore()
+	core.SetKeyLimit(5)
+	defer core.SetKeyLimit(core.DefaultKeyLimit)
+
+	// 1. Fill store to keyLimit = 5
+	for _, k := range []string{"k1", "k2", "k3", "k4", "k5"} {
+		cmd := fmt.Sprintf("*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$3\r\nval\r\n", len(k), k)
+		client.readBuf = []byte(cmd)
+		processClientBuffer(client, 0)
+		reply := readReply()
+		if !bytes.Equal(reply, []byte("+OK\r\n")) {
+			t.Fatalf("expected +OK\\r\\n, got %q", string(reply))
+		}
+	}
+
+	// 2. Overwrite existing key k1: should return +OK and NOT evict any other key
+	client.readBuf = []byte("*3\r\n$3\r\nSET\r\n$2\r\nk1\r\n$7\r\nnew_val\r\n")
+	processClientBuffer(client, 0)
+	reply := readReply()
+	if !bytes.Equal(reply, []byte("+OK\r\n")) {
+		t.Fatalf("expected +OK\\r\\n on overwrite, got %q", string(reply))
+	}
+
+	// Verify all 5 keys still exist
+	for _, k := range []string{"k1", "k2", "k3", "k4", "k5"} {
+		if core.Get(k) == nil {
+			t.Fatalf("expected key %s to still exist after overwrite", k)
+		}
+	}
+
+	// 3. Insert 6th key: triggers random eviction
+	client.readBuf = []byte("*3\r\n$3\r\nSET\r\n$2\r\nk6\r\n$3\r\nval\r\n")
+	processClientBuffer(client, 0)
+	reply = readReply()
+	if !bytes.Equal(reply, []byte("+OK\r\n")) {
+		t.Fatalf("expected +OK\\r\\n on inserting 6th key, got %q", string(reply))
+	}
+
+	// The 6th key must exist
+	if core.Get("k6") == nil {
+		t.Fatalf("expected key k6 to exist")
+	}
+
+	// Exactly 4 of original 5 keys must exist
+	remaining := 0
+	for _, k := range []string{"k1", "k2", "k3", "k4", "k5"} {
+		if core.Get(k) != nil {
+			remaining++
+		}
+	}
+	if remaining != 4 {
+		t.Fatalf("expected exactly 4 original keys remaining after eviction, got %d", remaining)
+	}
+}
+
 
 
