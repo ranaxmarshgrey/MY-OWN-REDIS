@@ -38,6 +38,12 @@ func Eval(tokens []string) ([]byte, error) {
 
 	case "TTL":
 		return EvalTtl(cmd.Args)
+
+	case "DEL":
+		return EvalDel(cmd.Args)
+
+	case "EXPIRE":
+		return EvalExpire(cmd.Args)
 	default:
 		return nil, fmt.Errorf("ERR unknown command '%s'", cmd.Cmd)
 	}
@@ -102,20 +108,13 @@ func EvalGet(args []string) ([]byte, error) {
 	obj := Get(key)
 	if obj == nil {
 		return Encode(nil, false), nil
-
-	}
-	if obj.ExpiresAt != -1 && time.Now().UnixMilli() >= obj.ExpiresAt {
-		delete(store, key)
-		return Encode(nil, false), nil
 	}
 	return Encode(obj.Value, false), nil
-
 }
 
 func EvalTtl(args []string) ([]byte, error) {
 	if len(args) != 1 {
 		return nil, errors.New("ERR wrong number of arguments for 'ttl' command")
-
 	}
 	key := args[0]
 	obj := Get(key)
@@ -128,14 +127,48 @@ func EvalTtl(args []string) ([]byte, error) {
 
 	nowMs := time.Now().UnixMilli()
 	durationLeft := obj.ExpiresAt - nowMs
-	if durationLeft < 0 {
-		delete(store, key)
+	if durationLeft <= 0 {
+		Delete(key)
 		return Encode(int64(-2), false), nil
 	}
 
 	secondsLeft := durationLeft / 1000
 
 	return Encode(int64(secondsLeft), false), nil
+}
+
+func EvalDel(args []string) ([]byte, error) {
+	if len(args) < 1 {
+		return nil, errors.New("ERR wrong number of arguments for 'del' command")
+	}
+	count := 0
+
+	for _, key := range args {
+		if Delete(key) {
+			count++
+		}
+	}
+	return Encode(int64(count), false), nil
+}
+
+func EvalExpire(args []string) ([]byte, error) {
+	if len(args) != 2 {
+		return nil, errors.New("ERR wrong number of arguments for 'expire' command")
+
+	}
+	key := args[0]
+	seconds, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil || seconds <= 0 {
+		return nil, errors.New("ERR invalid expire time")
+	}
+
+	obj := Get(key)
+	if obj == nil {
+		return Encode(int64(0), false), nil
+	}
+
+	obj.ExpiresAt = time.Now().UnixMilli() + seconds*1000
+	return Encode(int64(1), false), nil
 }
 
 var RESP_OK = []byte("+OK\r\n")

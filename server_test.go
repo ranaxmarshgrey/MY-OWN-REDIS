@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"my-own-redis/core"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -259,4 +261,181 @@ func TestParseIPv4(t *testing.T) {
 		}
 	}
 }
+
+func TestProcessClientBufferDEL(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("Socketpair failed: %v", err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+
+	client := &Client{
+		fd:      fds[0],
+		readBuf: make([]byte, 0),
+	}
+
+	readReply := func() []byte {
+		buf := make([]byte, 1024)
+		n, err := unix.Read(fds[1], buf)
+		if err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		return buf[:n]
+	}
+
+	// 1. DEL non-existent key -> :0\r\n
+	client.readBuf = []byte("*2\r\n$3\r\nDEL\r\n$7\r\nmissing\r\n")
+	processClientBuffer(client, 0)
+	reply := readReply()
+	if !bytes.Equal(reply, []byte(":0\r\n")) {
+		t.Fatalf("expected :0\\r\\n, got: %q", string(reply))
+	}
+
+	// 2. SET then DEL single key -> :1\r\n
+	client.readBuf = []byte("*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*2\r\n$3\r\nDEL\r\n$3\r\nfoo\r\n")
+	processClientBuffer(client, 0)
+	reply = readReply()
+	expected := []byte("+OK\r\n:1\r\n")
+	if !bytes.Equal(reply, expected) {
+		t.Fatalf("expected %q, got: %q", string(expected), string(reply))
+	}
+
+	// 3. Multi-key DEL
+	client.readBuf = []byte("*3\r\n$3\r\nSET\r\n$2\r\nk1\r\n$2\r\nv1\r\n*3\r\n$3\r\nSET\r\n$2\r\nk2\r\n$2\r\nv2\r\n*4\r\n$3\r\nDEL\r\n$2\r\nk1\r\n$2\r\nk2\r\n$7\r\nmissing\r\n")
+	processClientBuffer(client, 0)
+	reply = readReply()
+	expected = []byte("+OK\r\n+OK\r\n:2\r\n")
+	if !bytes.Equal(reply, expected) {
+		t.Fatalf("expected %q, got: %q", string(expected), string(reply))
+	}
+
+	// 4. DEL with no arguments error
+	client.readBuf = []byte("*1\r\n$3\r\nDEL\r\n")
+	processClientBuffer(client, 0)
+	reply = readReply()
+	expectedErr := []byte("-ERR wrong number of arguments for 'del' command\r\n")
+	if !bytes.Equal(reply, expectedErr) {
+		t.Fatalf("expected %q, got: %q", string(expectedErr), string(reply))
+	}
+}
+
+func TestProcessClientBufferEXPIRE(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("Socketpair failed: %v", err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+
+	client := &Client{
+		fd:      fds[0],
+		readBuf: make([]byte, 0),
+	}
+
+	readReply := func() []byte {
+		buf := make([]byte, 1024)
+		n, err := unix.Read(fds[1], buf)
+		if err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		return buf[:n]
+	}
+
+	// 1. EXPIRE on non-existent key -> :0\r\n
+	client.readBuf = []byte("*3\r\n$6\r\nEXPIRE\r\n$7\r\nmissing\r\n$2\r\n10\r\n")
+	processClientBuffer(client, 0)
+	reply := readReply()
+	if !bytes.Equal(reply, []byte(":0\r\n")) {
+		t.Fatalf("expected :0\\r\\n, got: %q", string(reply))
+	}
+
+	// 2. SET then EXPIRE then TTL
+	client.readBuf = []byte("*3\r\n$3\r\nSET\r\n$4\r\nuser\r\n$4\r\njohn\r\n*3\r\n$6\r\nEXPIRE\r\n$4\r\nuser\r\n$3\r\n100\r\n*2\r\n$3\r\nTTL\r\n$4\r\nuser\r\n")
+	processClientBuffer(client, 0)
+	reply = readReply()
+	if !bytes.Equal(reply, []byte("+OK\r\n:1\r\n:100\r\n")) && !bytes.Equal(reply, []byte("+OK\r\n:1\r\n:99\r\n")) {
+		t.Fatalf("expected +OK\\r\\n:1\\r\\n:100\\r\\n or :99\\r\\n, got: %q", string(reply))
+	}
+
+	// 3. EXPIRE wrong number of arguments
+	client.readBuf = []byte("*2\r\n$6\r\nEXPIRE\r\n$4\r\nuser\r\n")
+	processClientBuffer(client, 0)
+	reply = readReply()
+	expectedErr := []byte("-ERR wrong number of arguments for 'expire' command\r\n")
+	if !bytes.Equal(reply, expectedErr) {
+		t.Fatalf("expected %q, got: %q", string(expectedErr), string(reply))
+	}
+
+	// 4. EXPIRE invalid expire time (string instead of int)
+	client.readBuf = []byte("*3\r\n$6\r\nEXPIRE\r\n$4\r\nuser\r\n$3\r\nbad\r\n")
+	processClientBuffer(client, 0)
+	reply = readReply()
+	expectedErr = []byte("-ERR invalid expire time\r\n")
+	if !bytes.Equal(reply, expectedErr) {
+		t.Fatalf("expected %q, got: %q", string(expectedErr), string(reply))
+	}
+}
+
+func TestProcessClientBufferPassiveAndActiveCleanup(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("Socketpair failed: %v", err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+
+	client := &Client{
+		fd:      fds[0],
+		readBuf: make([]byte, 0),
+	}
+
+	readReply := func() []byte {
+		buf := make([]byte, 1024)
+		n, err := unix.Read(fds[1], buf)
+		if err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		return buf[:n]
+	}
+
+	// 1. SET with short PX (20ms) then GET after sleep -> passive cleanup returns $-1\r\n
+	client.readBuf = []byte("*5\r\n$3\r\nSET\r\n$5\r\npass1\r\n$3\r\nval\r\n$2\r\nPX\r\n$2\r\n20\r\n")
+	processClientBuffer(client, 0)
+	reply := readReply()
+	if !bytes.Equal(reply, []byte("+OK\r\n")) {
+		t.Fatalf("expected +OK\\r\\n, got: %q", string(reply))
+	}
+
+	time.Sleep(30 * time.Millisecond)
+
+	client.readBuf = []byte("*2\r\n$3\r\nGET\r\n$5\r\npass1\r\n")
+	processClientBuffer(client, 0)
+	reply = readReply()
+	if !bytes.Equal(reply, []byte("$-1\r\n")) {
+		t.Fatalf("expected $-1\\r\\n for passively expired key, got: %q", string(reply))
+	}
+
+	// 2. Active cleanup: SET with short PX (20ms), wait, run DeleteExpiredKeys(), then GET
+	client.readBuf = []byte("*5\r\n$3\r\nSET\r\n$5\r\nactv1\r\n$3\r\nval\r\n$2\r\nPX\r\n$2\r\n20\r\n")
+	processClientBuffer(client, 0)
+	reply = readReply()
+	if !bytes.Equal(reply, []byte("+OK\r\n")) {
+		t.Fatalf("expected +OK\\r\\n, got: %q", string(reply))
+	}
+
+	time.Sleep(30 * time.Millisecond)
+
+	// Trigger active cleanup routine as executed periodically in the event loop
+	core.DeleteExpiredKeys()
+
+	// GET should return nil bulk string $-1\r\n
+	client.readBuf = []byte("*2\r\n$3\r\nGET\r\n$5\r\nactv1\r\n")
+	processClientBuffer(client, 0)
+	reply = readReply()
+	if !bytes.Equal(reply, []byte("$-1\r\n")) {
+		t.Fatalf("expected $-1\\r\\n after active cleanup, got: %q", string(reply))
+	}
+}
+
 

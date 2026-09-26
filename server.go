@@ -6,6 +6,7 @@ import (
 	"my-own-redis/core"
 	"net"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -75,15 +76,21 @@ func StartServer(host string, port int) {
 	log.Printf("Server Listening on %s:%d with epoll...", host, port)
 	events := make([]unix.EpollEvent, 128)
 
+	lastCleanup := time.Now()
+	cleanupInterval := 100 * time.Millisecond
 	for {
 		//1:sleep until something is ready
-		n, err := unix.EpollWait(epollFd, events, -1)
+		n, err := unix.EpollWait(epollFd, events, 100)
 		if err != nil {
 			if err == unix.EINTR {
 				continue
 			}
 			log.Fatal(err)
 
+		}
+		if time.Since(lastCleanup) > cleanupInterval {
+			core.DeleteExpiredKeys()
+			lastCleanup = time.Now()
 		}
 
 		//2:iterate throguh only the active sockets
