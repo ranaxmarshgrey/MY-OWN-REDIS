@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"io"
 	"strconv"
 )
 
@@ -15,6 +16,28 @@ func Decode(data []byte) (interface{}, error) {
 		return nil, fmt.Errorf("trailing data after RESP value")
 	}
 	return val, nil
+}
+
+// DecodeMulti decodes all concatenated RESP commands from a byte slice.
+// It loops continuously, consuming one RESP value at a time, and returns
+// a slice of all decoded values — enabling command pipelining.
+// An io.EOF after at least one value is treated as a clean end-of-stream.
+func DecodeMulti(data []byte) ([]interface{}, error) {
+	var values []interface{}
+	pos := 0
+	for pos < len(data) {
+		val, delta, err := DecodeOne(data[pos:])
+		if err != nil {
+			// io.EOF signals a clean end-of-stream after full commands
+			if err == io.EOF && len(values) > 0 {
+				break
+			}
+			return nil, err
+		}
+		values = append(values, val)
+		pos += delta
+	}
+	return values, nil
 }
 
 // DecodeOne attempts to decode a single RESP value from data.

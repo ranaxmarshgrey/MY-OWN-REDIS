@@ -1,12 +1,18 @@
 package core
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// RedisCmds represents a batch of pipelined commands decoded from a single
+// network payload. Using a named slice type keeps helper-function signatures
+// clean and self-documenting.
+type RedisCmds []*RedisCmd
 
 type RedisCmd struct {
 	Cmd  string
@@ -19,6 +25,60 @@ func ParseCommand(tokens []string) RedisCmd {
 	cmd.Args = tokens[1:]
 
 	return cmd
+}
+
+// ReadCommands decodes all concatenated RESP commands from a raw byte buffer
+// and returns them as a RedisCmds batch ready for evaluation.
+// Incomplete or un-parseable payloads return an error.
+func ReadCommands(data []byte) (RedisCmds, error) {
+	values, err := DecodeMulti(data)
+	if err != nil {
+		return nil, err
+	}
+
+	var cmds RedisCmds
+	for _, v := range values {
+		arr, ok := v.([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("ERR expected array, got %T", v)
+		}
+		tokens := make([]string, len(arr))
+		for i, elem := range arr {
+			str, ok := elem.(string)
+			if !ok {
+				return nil, fmt.Errorf("ERR non-string argument in command")
+			}
+			tokens[i] = str
+		}
+		if len(tokens) == 0 {
+			continue
+		}
+		cmd := ParseCommand(tokens)
+		cmds = append(cmds, &cmd)
+	}
+	return cmds, nil
+}
+
+// EvalAndRespond evaluates every command in the pipelined batch, collects all
+// RESP-encoded response bytes into an in-memory buffer, and returns the
+// complete payload to the caller for a single socket write.
+func EvalAndRespond(cmds RedisCmds) []byte {
+	var buf bytes.Buffer
+	for _, cmd := range cmds {
+		// Reconstruct the full tokens slice expected by Eval: [command, arg1, arg2, ...]
+		tokens := append([]string{cmd.Cmd}, cmd.Args...)
+		resBytes, err := Eval(tokens)
+		if err != nil {
+			msg := err.Error()
+			if strings.HasPrefix(msg, "ERR") {
+				resBytes = []byte(fmt.Sprintf("-%s\r\n", msg))
+			} else {
+				resBytes = []byte(fmt.Sprintf("-ERR %s\r\n", msg))
+			}
+		}
+		buf.Write(resBytes)
+	}
+	return buf.Bytes()
 }
 
 func Eval(tokens []string) ([]byte, error) {
