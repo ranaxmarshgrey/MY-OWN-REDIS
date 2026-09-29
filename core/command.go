@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -104,6 +105,13 @@ func Eval(tokens []string) ([]byte, error) {
 
 	case "EXPIRE":
 		return EvalExpire(cmd.Args)
+
+	case "PEXPIREAT":
+		return EvalPExpireAt(cmd.Args)
+
+	case "BGREWRITEAOF":
+		return EvalBgRewriteAOF(cmd.Args)
+
 	default:
 		return nil, fmt.Errorf("ERR unknown command '%s'", cmd.Cmd)
 	}
@@ -229,6 +237,38 @@ func EvalExpire(args []string) ([]byte, error) {
 
 	obj.ExpiresAt = time.Now().UnixMilli() + seconds*1000
 	return Encode(int64(1), false), nil
+}
+
+// EvalPExpireAt sets the absolute expiry timestamp (Unix ms) for a key.
+// This command is written to the AOF by DumpAllAOF so TTLs survive restarts.
+func EvalPExpireAt(args []string) ([]byte, error) {
+	if len(args) != 2 {
+		return nil, errors.New("ERR wrong number of arguments for 'pexpireat' command")
+	}
+	key := args[0]
+	ts, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil || ts <= 0 {
+		return nil, errors.New("ERR invalid expire time in 'pexpireat' command")
+	}
+
+	obj := Get(key)
+	if obj == nil {
+		return Encode(int64(0), false), nil
+	}
+	obj.ExpiresAt = ts
+	return Encode(int64(1), false), nil
+}
+
+// EvalBgRewriteAOF forks the AOF dump into a goroutine and immediately
+// returns "+Background append only file rewriting started" — matching
+// Redis's own response so existing clients don't break.
+func EvalBgRewriteAOF(args []string) ([]byte, error) {
+	go func() {
+		if err := DumpAllAOF(); err != nil {
+			fmt.Fprintf(os.Stderr, "aof background rewrite error: %v\n", err)
+		}
+	}()
+	return []byte("+Background append only file rewriting started\r\n"), nil
 }
 
 var RESP_OK = []byte("+OK\r\n")

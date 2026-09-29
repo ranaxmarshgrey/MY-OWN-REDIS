@@ -14,6 +14,8 @@ A lightweight, custom in-memory key-value database built from scratch in Go. It 
   - [3. Command Execution Flow](#3-command-execution-flow)
   - [4. Expiration Cleanup: Passive vs Active](#4-expiration-cleanup-passive-vs-active)
   - [5. Cache Eviction (Random Eviction)](#5-cache-eviction-random-eviction)
+  - [6. Command Pipelining](#6-command-pipelining)
+  - [7. AOF Persistence](#7-aof-persistence)
 - [Supported Commands](#supported-commands)
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
@@ -44,6 +46,8 @@ The goal of this project is to build an in-memory key-value store that works jus
 | **Passive Expiration** | On-demand key eviction when accessing expired keys (*lazy deletion*). |
 | **Active Expiration** | Background probabilistic sampling to purge expired keys in batches without freezing the server. |
 | **Random Eviction** | Enforces a configurable key limit (`keyLimit`), evicting arbitrary keys when full while safely preserving overwrites. |
+| **Command Pipelining** | Decodes and executes multiple RESP commands from a single network read, batching all replies into one write. |
+| **AOF Persistence** | Dumps every live key to `appendonly.aof` on `BGREWRITEAOF`; replays the file on startup to restore data after a crash. |
 
 ---
 
@@ -140,6 +144,66 @@ Is new_key already present?
 
 ---
 
+### 6. Command Pipelining
+
+Normally, a client sends one command and waits for the reply before sending the next. **Pipelining** lets a client send many commands all at once without waiting, cutting round-trip time dramatically.
+
+This server handles pipelining transparently:
+
+```text
+[ Client sends 3 commands in one TCP packet ]
+        │
+        ▼
+[ DecodeMulti() loops through the buffer ]
+  ├── Decodes command 1 → PING
+  ├── Decodes command 2 → SET foo bar
+  └── Decodes command 3 → GET foo
+        │
+        ▼
+[ EvalAndRespond() runs each command ]
+  └── Collects all 3 replies into one buffer
+        │
+        ▼
+[ Single socket write back to client ]
+```
+
+- [`DecodeMulti()`](file:///home/jayanthgowda/my-own-redis/MY-OWN-REDIS/core/resp.go#L25) keeps consuming RESP values from the buffer until it's empty.
+- [`EvalAndRespond()`](file:///home/jayanthgowda/my-own-redis/MY-OWN-REDIS/core/command.go#L65) evaluates each command and joins all replies into a single write — so the client receives everything in one network round-trip.
+
+---
+
+### 7. AOF Persistence
+
+Redis stores data in RAM — so everything is lost if the process crashes. **AOF (Append-Only File)** solves this by saving a snapshot of all current keys to disk.
+
+#### How it works here
+
+1. **`BGREWRITEAOF`** — You (or a scheduled job) send this command. The server launches a background goroutine that:
+   - Iterates over every live key in the store.
+   - Skips keys that have already expired.
+   - Writes each key as a RESP-encoded `SET key value` command.
+   - If the key has a future TTL, also writes a `PEXPIREAT key <timestamp_ms>` line to preserve the exact expiry time.
+   - Writes everything to a **temporary file first**, then renames it to `appendonly.aof` atomically — so a crash mid-write never corrupts the file.
+
+2. **`LoadAOF()`** — Called once at server startup. It reads `appendonly.aof` and replays every command through the normal `Eval` pipeline to rebuild the in-memory state exactly as it was before the crash.
+
+```text
+[ Server crash / restart ]
+        │
+        ▼
+[ LoadAOF() opens appendonly.aof ]
+  ├── Reads: SET hello world
+  ├── Reads: SET session abc123
+  └── Reads: PEXPIREAT session 1727000000000
+        │
+        ▼
+[ Store is fully restored in memory ]
+```
+
+> **Tip**: Validate the file with the official Redis tool: `redis-check-aof appendonly.aof`
+
+---
+
 ## 🛠 Supported Commands
 
 | Command | Usage | Description | Example |
@@ -150,6 +214,8 @@ Is new_key already present?
 | **`TTL`** | `TTL key` | Returns remaining time-to-live in seconds | `TTL user` &rarr; `:58` |
 | **`DEL`** | `DEL key [key ...]` | Removes one or more keys; returns deleted count | `DEL k1 k2 missing` &rarr; `:2` |
 | **`EXPIRE`** | `EXPIRE key seconds` | Sets or updates a key's expiration | `EXPIRE user 120` &rarr; `:1` |
+| **`PEXPIREAT`** | `PEXPIREAT key unix_ms` | Sets expiry as an absolute Unix millisecond timestamp | `PEXPIREAT session 1727000000000` &rarr; `:1` |
+| **`BGREWRITEAOF`** | `BGREWRITEAOF` | Dumps all live keys to `appendonly.aof` in the background | `BGREWRITEAOF` &rarr; `+Background...` |
 
 ---
 
@@ -234,13 +300,16 @@ MY-OWN-REDIS/
 ├── main.go               # Server entry point & CLI flags (--host, --port)
 ├── server.go             # Epoll event loop, connection handling, socket I/O
 ├── server_test.go        # Socket-level integration tests
+├── appendonly.aof        # AOF persistence file (auto-created by BGREWRITEAOF)
 ├── implementation-notes.md # Notes on event loop design and stream buffers
 ├── ARCHITECTURE_FLOW.md  # Detailed execution flow and state diagrams
 └── core/
     ├── resp.go           # RESP protocol tokenizer, parser, and encoder
     ├── resp_test.go      # RESP decoding & edge-case unit tests
-    ├── command.go        # Command evaluator (PING, SET, GET, TTL, DEL, EXPIRE)
+    ├── command.go        # Command evaluator (all supported commands)
     ├── command_test.go   # Command-level unit tests & expiration sampling tests
     ├── store.go          # In-memory dictionary, eviction, and TTL active cleanup
-    └── eviction_test.go  # Random eviction and capacity limit unit tests
+    ├── eviction_test.go  # Random eviction and capacity limit unit tests
+    ├── aof.go            # AOF dump (DumpAllAOF) and replay (LoadAOF) logic
+    └── aof_test.go       # AOF round-trip, expired-key skipping, and BGREWRITEAOF tests
 ```
