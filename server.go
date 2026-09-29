@@ -5,15 +5,17 @@ import (
 	"log"
 	"my-own-redis/core"
 	"net"
-	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
 type Client struct {
-	fd      int
-	readBuf []byte
+	fd          int
+	readBuf     []byte
+	// pendingCmds accumulates all fully-decoded commands from a single read
+	// event before they are evaluated and flushed as one batched response.
+	pendingCmds core.RedisCmds
 }
 
 var clients = make(map[int]*Client)
@@ -180,16 +182,17 @@ func handleClientData(fd int32, epollFd int) {
 
 func processClientBuffer(client *Client, epollFd int) {
 	for len(client.readBuf) > 0 {
+		// Attempt to parse one command at a time using DecodeOne so that
+		// incomplete partial data is safely left in the buffer.
 		value, delta, err := core.DecodeOne(client.readBuf)
 		if err != nil {
-			// Incomplete data: wait for more data from client
+			// Incomplete data: wait for more bytes from the client.
 			break
 		}
 
 		arr, ok := value.([]interface{})
 		if !ok {
-			reply := []byte("-ERR invalid command\r\n")
-			_, _ = unix.Write(client.fd, reply)
+			// Discard the malformed frame and move past it.
 			client.readBuf = client.readBuf[delta:]
 			continue
 		}
@@ -206,24 +209,24 @@ func processClientBuffer(client *Client, epollFd int) {
 		}
 
 		if invalid || len(cmdTokens) == 0 {
-			reply := []byte("-ERR invalid command\r\n")
-			_, _ = unix.Write(client.fd, reply)
 			client.readBuf = client.readBuf[delta:]
 			continue
 		}
 
-		resBytes, err := core.Eval(cmdTokens)
-		if err != nil {
-			msg := err.Error()
-			if strings.HasPrefix(msg, "ERR") {
-				resBytes = []byte(fmt.Sprintf("-%s\r\n", msg))
-			} else {
-				resBytes = []byte(fmt.Sprintf("-ERR %s\r\n", msg))
-			}
-		}
-		_, _ = unix.Write(client.fd, resBytes)
-
+		// Collect this fully-decoded command and advance the buffer.
+		cmd := core.ParseCommand(cmdTokens)
+		client.pendingCmds = append(client.pendingCmds, &cmd)
 		client.readBuf = client.readBuf[delta:]
+	}
+
+	// If we decoded any commands, evaluate the whole batch and write
+	// all responses to the socket in a single call — the core of pipelining.
+	if len(client.pendingCmds) > 0 {
+		resBytes := core.EvalAndRespond(client.pendingCmds)
+		if len(resBytes) > 0 {
+			_, _ = unix.Write(client.fd, resBytes)
+		}
+		client.pendingCmds = nil
 	}
 }
 

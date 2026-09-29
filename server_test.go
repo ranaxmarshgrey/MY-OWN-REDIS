@@ -271,6 +271,9 @@ func TestProcessClientBufferDEL(t *testing.T) {
 	defer unix.Close(fds[0])
 	defer unix.Close(fds[1])
 
+	// Clear store to prevent key-count from previous tests triggering random eviction.
+	core.ClearStore()
+
 	client := &Client{
 		fd:      fds[0],
 		readBuf: make([]byte, 0),
